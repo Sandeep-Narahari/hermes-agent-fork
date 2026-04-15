@@ -39,6 +39,27 @@ fi
 # --- Running as hermes from here ---
 source "${INSTALL_DIR}/.venv/bin/activate"
 
+# --- Optional Bulk Migration ---
+# If HERMES_HOME is uninitialized, we can pull in an entire older backup
+# (including config.yaml, memories, sessions, etc.)
+if [ ! -f "$HERMES_HOME/config.yaml" ]; then
+    if [ -n "$HERMES_MIGRATION_URL" ]; then
+        echo "Found HERMES_MIGRATION_URL. Downloading migration archive..."
+        curl -sL "$HERMES_MIGRATION_URL" -o /tmp/migration.tar.gz || wget -qO /tmp/migration.tar.gz "$HERMES_MIGRATION_URL"
+        if [ -f /tmp/migration.tar.gz ]; then
+            echo "Extracting archive directly into $HERMES_HOME..."
+            # --strip-components=1 handles hermes profile export default.tar.gz which has default/ root
+            tar -xzf /tmp/migration.tar.gz -C "$HERMES_HOME" --strip-components=1 || true
+            rm -f /tmp/migration.tar.gz
+        else
+            echo "Warning: Failed to download migration archive from $HERMES_MIGRATION_URL"
+        fi
+    elif [ -n "$HERMES_MIGRATION_DIR" ] && [ -d "$HERMES_MIGRATION_DIR" ]; then
+        echo "Found HERMES_MIGRATION_DIR at $HERMES_MIGRATION_DIR. Copying all files to $HERMES_HOME..."
+        cp -pnR "$HERMES_MIGRATION_DIR/"* "$HERMES_HOME/" || true
+    fi
+fi
+
 # Create essential directory structure.  Cache and platform directories
 # (cache/images, cache/audio, platforms/whatsapp, etc.) are created on
 # demand by the application — don't pre-create them here so new installs
@@ -48,24 +69,104 @@ source "${INSTALL_DIR}/.venv/bin/activate"
 # ephemeral and shared across profiles.  See issue #4426.
 mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
 
+# Setup SSH if requested via environment variables
+if [ -n "$SSH_PASSWORD" ] || [ -n "$SSH_PUBKEY" ]; then
+    mkdir -p /run/sshd
+    if [ -n "$SSH_PASSWORD" ]; then
+        echo "root:$SSH_PASSWORD" | chpasswd
+        sed -i 's/#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+        sed -i 's/#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    fi
+    if [ -n "$SSH_PUBKEY" ]; then
+        mkdir -p /root/.ssh
+        echo "$SSH_PUBKEY" >> /root/.ssh/authorized_keys
+        chmod 700 /root/.ssh
+        chmod 600 /root/.ssh/authorized_keys
+        sed -i 's/#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+    fi
+    /usr/sbin/sshd
+    echo "SSH server started."
+fi
+
 # .env
 if [ ! -f "$HERMES_HOME/.env" ]; then
     cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env"
+    
+    # Auto-populate .env from Akash Environment Variables if they exist
+    echo "Populating .env from environment variables..."
+    [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "TELEGRAM_BOT_TOKEN=\"$TELEGRAM_BOT_TOKEN\"" >> "$HERMES_HOME/.env"
+    [ -n "$TELEGRAM_ALLOWED_USERS" ] && echo "TELEGRAM_ALLOWED_USERS=\"$TELEGRAM_ALLOWED_USERS\"" >> "$HERMES_HOME/.env"
+    [ -n "$OPENAI_API_KEY" ] && echo "OPENAI_API_KEY=\"$OPENAI_API_KEY\"" >> "$HERMES_HOME/.env"
+    [ -n "$OPENAI_BASE_URL" ] && echo "OPENAI_BASE_URL=\"$OPENAI_BASE_URL\"" >> "$HERMES_HOME/.env"
 fi
 
 # config.yaml
 if [ ! -f "$HERMES_HOME/config.yaml" ]; then
     cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
+
+    # Use Python to safely update config.yaml — sed injection can produce
+    # malformed YAML which causes HTTP 400 "JSON parse" errors via bad requests.
+    python3 - <<PYEOF
+import yaml, os, sys
+
+cfg_path = "$HERMES_HOME/config.yaml"
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+
+model_cfg = cfg.get("model", {})
+if not isinstance(model_cfg, dict):
+    model_cfg = {}
+
+custom_model = os.getenv("LLM_MODEL", "").strip()
+base_url     = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+api_key      = os.getenv("OPENAI_API_KEY", "").strip()
+
+if custom_model:
+    model_cfg["default"]  = custom_model
+    model_cfg["provider"] = "custom"
+if base_url:
+    model_cfg["base_url"] = base_url
+if api_key:
+    model_cfg["api_key"] = api_key
+
+cfg["model"] = model_cfg
+
+with open(cfg_path, "w", encoding="utf-8") as f:
+    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+
+if custom_model or base_url or api_key:
+    print(f"Config updated: model={custom_model or '(unchanged)'}, base_url={base_url or '(unchanged)'}")
+PYEOF
 fi
 
 # SOUL.md
 if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
     cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
 fi
-
+    
 # Sync bundled skills (manifest-based so user edits are preserved)
 if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
+fi
+
+# Auto-detect gateway mode: if any messaging platform token is set and the
+# caller did not explicitly pass a subcommand, run the gateway in the
+# foreground (hermes gateway) instead of the interactive CLI which exits
+# immediately when stdin is not a terminal.
+if [ $# -eq 0 ] && {
+    [ -n "$TELEGRAM_BOT_TOKEN" ] ||
+    [ -n "$DISCORD_BOT_TOKEN" ] ||
+    [ -n "$SLACK_BOT_TOKEN" ] ||
+    [ -n "$SLACK_APP_TOKEN" ] ||
+    [ -n "$WHATSAPP_ENABLED" ] ||
+    [ -n "$SIGNAL_HTTP_URL" ] ||
+    [ -n "$MATRIX_HOMESERVER" ] ||
+    [ -n "$DINGTALK_CLIENT_ID" ] ||
+    [ -n "$FEISHU_APP_ID" ] ||
+    [ -n "$WECOM_BOT_ID" ] ||
+    [ -n "$TWILIO_ACCOUNT_SID" ] ||
+    [ -n "$EMAIL_ADDRESS" ]; }; then
+    exec hermes gateway
 fi
 
 exec hermes "$@"
